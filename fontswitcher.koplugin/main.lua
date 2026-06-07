@@ -10,6 +10,12 @@ local CreDocument = require("document/credocument")
 local Device = require("device")
 local Screen = Device.screen
 
+-- Add this plugin's directory to the Lua search path so that bundled files
+-- (fontchooser_local.lua) can be loaded without shadowing KOReader's own
+-- system modules (which would happen if we just used "fontchooser").
+local _plugin_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or "./"
+package.path = _plugin_dir .. "?.lua;" .. package.path
+
 local FontSwitcher = WidgetContainer:extend{
     name = "fontswitcher",
     is_doc_only = true,
@@ -307,10 +313,13 @@ function FontSwitcher:showFontMenu()
         return
     end
 
-    -- Try the FontChooser widget (same dialog used by the Zen UI plugin).
-    -- Falls back to the original TouchMenu when the widget is unavailable
-    -- (KOReader builds older than ~2023).
-    local ok_fc, FontChooser = pcall(require, "ui/widget/fontchooser")
+    -- Try our bundled font chooser first (fontchooser_local.lua ships with
+    -- the plugin and shows only serif fonts). Fall back to the system widget
+    -- if the local file is absent, then to the original TouchMenu.
+    local ok_fc, FontChooser = pcall(require, "fontchooser_local")
+    if not ok_fc then
+        ok_fc, FontChooser = pcall(require, "ui/widget/fontchooser")
+    end
     if ok_fc and FontChooser then
         self:_showWithFontChooser(FontChooser, fonts)
     else
