@@ -1,7 +1,9 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonTable = require("ui/widget/buttontable")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local CheckButton = require("ui/widget/checkbutton")
 local FocusManager = require("ui/widget/focusmanager")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
 local Font = require("ui/font")
 local FontList = require("fontlist")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -52,6 +54,30 @@ local function isSansSerif(font_info)
     return p2 >= 9 and p2 <= 13
 end
 
+--- Returns true for decorative (panose_1 == 4) and symbol/pictorial
+--- (panose_1 == 5) fonts.  Fonts with panose_1 == 0 pass through.
+local function isDecorative(font_info)
+    local info = font_info and font_info[1]
+    if not info then return false end
+    return info.panose_1 == 4 or info.panose_1 == 5
+end
+
+-- ── Filter state ──────────────────────────────────────────────────────────────
+-- Persists for the session; not written to disk.
+-- true  = that category is EXCLUDED from the list.
+-- B (bold) and I (italic) filter on fontinfo[1].bold / .italic.
+-- Sans, Mono, Deco filter on panose metadata.
+-- Defaults: Sans and Mono excluded (matching the previous hard-coded behaviour);
+--           Bold, Italic, Deco shown by default.
+
+local _filter_state = {
+    bold   = false,
+    italic = false,
+    sans   = true,
+    mono   = true,
+    deco   = false,
+}
+
 local FontChooser = FocusManager:extend{
     title = "",
     font_file = nil, -- current
@@ -92,8 +118,14 @@ function FontChooser:init()
 
     local radio_buttons = {} -- one column
     for font_file, font_info in pairs(FontList.fontinfo) do
-        if isMonospace(font_info) or isSansSerif(font_info) then goto continue end
+        local info = font_info and font_info[1]
+        if _filter_state.mono   and isMonospace(font_info)   then goto continue end
+        if _filter_state.sans   and isSansSerif(font_info)   then goto continue end
+        if _filter_state.deco   and isDecorative(font_info)  then goto continue end
+        if _filter_state.bold   and info and info.bold        then goto continue end
+        if _filter_state.italic and info and info.italic      then goto continue end
         local name_text, name = self.getFontNameText(font_file)
+        if not name_text then goto continue end  -- malformed or missing record
         if self.default_font_file and self.default_font_file == font_file then
             name_text = name_text .. "  ★"
         end
@@ -108,6 +140,16 @@ function FontChooser:init()
             end,
         }})
         ::continue::
+    end
+    -- Guard: RadioButtonTable requires at least one entry.
+    if #radio_buttons == 0 then
+        table.insert(radio_buttons, {{
+            text     = _("No fonts match the current filters"),
+            name     = "",
+            checked  = true,
+            provider = nil,
+            face     = Font:getFace("NotoSans-Regular.ttf", 22),
+        }})
     end
     if #radio_buttons > 1 then
         table.sort(radio_buttons, function(a, b)
@@ -130,6 +172,49 @@ function FontChooser:init()
     }
     self:mergeLayoutInVertical(radio_button_table)
 
+    -- ── Filter checkbox row ───────────────────────────────────────────────────
+    -- One compact horizontal row that lets the user exclude font categories.
+    -- Toggling any checkbox closes and immediately reopens the dialog with the
+    -- updated _filter_state applied to the font list.
+    --
+    -- Semantics: checked = that category IS excluded from the list.
+
+    local filter_keys   = { "bold",  "italic", "sans",  "mono",  "deco"  }
+    local filter_labels = { "B",     "I",      "Sans",  "Mono",  "Deco"  }
+
+    local filter_group = HorizontalGroup:new{ align = "center" }
+    for i = 1, #filter_keys do
+        local key   = filter_keys[i]
+        local label = filter_labels[i]
+        local dialog_ref = self   -- explicit upvalue for the closure below
+        table.insert(filter_group, CheckButton:new{
+            text     = label,
+            checked  = _filter_state[key],
+            parent   = self,
+            callback = function()
+                _filter_state[key] = not _filter_state[key]
+                UIManager:close(dialog_ref)
+                UIManager:show(FontChooser:new{
+                    title             = dialog_ref.title,
+                    font_file         = dialog_ref.font_file,
+                    default_font_file = dialog_ref.default_font_file,
+                    callback          = dialog_ref.callback,
+                    close_callback    = dialog_ref.close_callback,
+                })
+            end,
+        })
+    end
+
+    local filter_row = CenterContainer:new{
+        dimen = Geom:new{
+            w = width,
+            h = filter_group:getSize().h,
+        },
+        filter_group,
+    }
+
+    -- ── Action buttons ────────────────────────────────────────────────────────
+
     local buttons = {{
         {
             text = _("Close"),
@@ -142,10 +227,19 @@ function FontChooser:init()
             text = _("Set font"),
             is_enter_default = true,
             callback = function()
+                local provider = radio_button_table.checked_button
+                             and radio_button_table.checked_button.provider
+                if not provider then
+                    UIManager:show(InfoMessage:new{
+                        text    = _("No font selected."),
+                        timeout = 2,
+                    })
+                    return
+                end
                 if not self.keep_shown_on_apply then
                     UIManager:close(self)
                 end
-                self.callback(radio_button_table.checked_button.provider)
+                self.callback(provider)
             end,
         },
     }}
@@ -160,11 +254,13 @@ function FontChooser:init()
     self.radio_button_table_height = radio_button_table:getSize().h
     local max_radio_button_container_height = math.floor(screen_h*0.8
                     - title_bar:getHeight()
-                    - Size.span.vertical_large*4 - button_table:getSize().h)
+                    - Size.span.vertical_large*6   -- 4 original + 2 for filter row spans
+                    - button_table:getSize().h
+                    - filter_row:getSize().h)
     if self.radio_button_table_height > max_radio_button_container_height then
         self.is_scrollable = true
         -- adjust scrollable container height to fit integer number of buttons
-        local radio_button_height = radio_button_table.checked_button:getSize().h -- all buttons of the same height
+        local radio_button_height = radio_button_table.checked_button:getSize().h
         self.radio_buttons_per_page = math.floor(max_radio_button_container_height / radio_button_height)
         self.radio_button_container_height = self.radio_buttons_per_page * radio_button_height
     else
@@ -196,13 +292,11 @@ function FontChooser:init()
         VerticalGroup:new{
             align = "center",
             title_bar,
-            VerticalSpan:new{
-                width = Size.span.vertical_large*2,
-            },
+            VerticalSpan:new{ width = Size.span.vertical_large*2 },
             self.cropping_widget,
-            VerticalSpan:new{
-                width = Size.span.vertical_large*2,
-            },
+            VerticalSpan:new{ width = Size.span.vertical_large },
+            filter_row,
+            VerticalSpan:new{ width = Size.span.vertical_large },
             CenterContainer:new{
                 dimen = Geom:new{
                     w = width,
