@@ -5,16 +5,106 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Event = require("ui/event")
 local logger = require("logger")
 local _ = require("gettext")
-local TouchMenu = require("ui/widget/touchmenu")
 local CreDocument = require("document/credocument")
 local Device = require("device")
-local Screen = Device.screen
 
--- Add this plugin's directory to the Lua search path so that bundled files
--- (fontchooser_local.lua) can be loaded without shadowing KOReader's own
--- system modules (which would happen if we just used "fontchooser").
+-- Resolve the plugin directory so font_picker_dialog.lua (bundled alongside
+-- this file) can be loaded with a plain require() without shadowing any
+-- system module.
 local _plugin_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or "./"
 package.path = _plugin_dir .. "?.lua;" .. package.path
+
+-- FontList provides per-file metadata (panose bytes, mono flag) used when
+-- building the face→attribute cache.  Load defensively; some stripped builds
+-- may not include it.
+local ok_fl, FontList = pcall(require, "fontlist")
+if not ok_fl then FontList = nil end
+
+-- ── Face metadata helpers ─────────────────────────────────────────────────────
+-- norm() collapses a name to a case-insensitive, punctuation-free token so
+-- that family names and face names can be prefix-matched reliably.
+-- e.g. "Noto Serif" → "notserif", "Noto Serif Regular" → "notoserifregular"
+
+local function norm(s)
+    return (s or ""):lower():gsub("[%s%-_]+", "")
+end
+
+-- buildFaceMeta() maps every face name returned by cre.getFontFaces() to a
+-- small attribute record used by FontPickerDialog to apply the filter row.
+--
+-- Bold / italic are detected from the face name itself (weight words in the
+-- name are more reliable than per-file fontinfo.bold for multi-weight families).
+-- Sans, mono, and deco are detected from panose / FreeType metadata in FontList
+-- (family-level properties shared by every weight of the same family).
+
+local function buildFaceMeta(face_list)
+    -- Index fontinfo by normalised family name; one entry per family suffices
+    -- because panose and mono flag are the same for all weights of a family.
+    local family_data = {}
+    if FontList and FontList.fontinfo then
+        for _, font_info in pairs(FontList.fontinfo) do
+            local info = font_info and font_info[1]
+            if info and info.name then
+                local fn = norm(info.name)
+                if fn ~= "" and not family_data[fn] then
+                    family_data[fn] = info
+                end
+            end
+        end
+    end
+
+    local meta = {}
+    for _, face in ipairs(face_list) do
+        local fl = face:lower()
+        local fn = norm(face)
+
+        -- Bold / italic from weight / style words in the face name.
+        local is_bold   = fl:find("bold")    ~= nil
+                       or fl:find("heavy")   ~= nil
+                       or fl:find("black")   ~= nil
+        local is_italic = fl:find("italic")  ~= nil
+                       or fl:find("oblique") ~= nil
+
+        -- Family-level classification: find the fontinfo entry whose normalised
+        -- family name is the longest prefix of the normalised face name.
+        -- Longest-match prevents "Noto" (sans) from shadowing "Noto Serif"
+        -- when pairs() happens to visit the shorter key first.
+        local fd, fd_len = nil, 0
+        for family_n, info in pairs(family_data) do
+            if fn:find(family_n, 1, true) == 1 and #family_n > fd_len then
+                fd, fd_len = info, #family_n
+            end
+        end
+
+        -- Mono: FreeType flag preferred; name-heuristic as fallback.
+        local is_mono = (fd and fd.mono == true)
+                     or fl:find("mono") ~= nil
+                     or fl:find("code") ~= nil
+
+        -- Sans / deco: panose byte 1 only (family-level; requires fontinfo).
+        --   panose_1 == 2 → Latin text; panose_2 9–13 → sans-serif variants.
+        --   panose_1 == 4 → decorative; panose_1 == 5 → symbol / pictorial.
+        local is_sans, is_deco = false, false
+        if fd then
+            local p1 = fd.panose_1 or 0
+            if p1 == 2 then
+                local p2 = fd.panose_2 or 0
+                is_sans = p2 >= 9 and p2 <= 13
+            elseif p1 == 4 or p1 == 5 then
+                is_deco = true
+            end
+        end
+
+        meta[face] = {
+            bold   = is_bold,
+            italic = is_italic,
+            mono   = is_mono,
+            sans   = is_sans,
+            deco   = is_deco,
+        }
+    end
+    return meta
+end
 
 local FontSwitcher = WidgetContainer:extend{
     name = "fontswitcher",
@@ -133,17 +223,68 @@ function FontSwitcher:getFontList()
     return fonts
 end
 
+--- Lazily builds and caches a face-name → attribute table for the filter row.
+--- The cache lives on the plugin instance for the document's lifetime.
+function FontSwitcher:_getFaceMeta()
+    if not self._face_meta_cache then
+        -- Ensure the face list is also cached before building meta.
+        if not self._face_list_cache then
+            self._face_list_cache = self:getFontList()
+        end
+        self._face_meta_cache = buildFaceMeta(self._face_list_cache)
+    end
+    return self._face_meta_cache
+end
+
+--- Returns the face list with the current filter state applied, so that
+--- Next / Previous Font cycle only through fonts visible in the dialog.
+--- Filter state is read live from G_reader_settings so it always reflects
+--- whatever the user last set in the dialog.
+--- Note: defaults here must stay in sync with those in font_picker_dialog.lua.
+function FontSwitcher:_getFilteredFaces()
+    local face_list = self._face_list_cache or self:getFontList()
+    local face_meta = self:_getFaceMeta()
+    local saved = G_reader_settings:readSetting("fontswitcher_filters") or {}
+    local f = {
+        bold   = saved.bold   ~= nil and saved.bold   or true,
+        italic = saved.italic ~= nil and saved.italic or true,
+        sans   = saved.sans   ~= nil and saved.sans   or false,
+        mono   = saved.mono   ~= nil and saved.mono   or false,
+        deco   = saved.deco   ~= nil and saved.deco   or true,
+    }
+    local filtered = {}
+    for _, face in ipairs(face_list) do
+        local m = face_meta[face] or {}
+        if  (f.bold   or not m.bold)
+        and (f.italic or not m.italic)
+        and (f.sans   or not m.sans)
+        and (f.mono   or not m.mono)
+        and (f.deco   or not m.deco) then
+            table.insert(filtered, face)
+        end
+    end
+    return filtered
+end
+
+--- Returns the face name currently set for the open document.
+--- Mirrors the three-way fallback used by the original plugin.
+function FontSwitcher:getCurrentFace()
+    return self.ui.doc_settings:readSetting("font_face")
+        or G_reader_settings:readSetting("cre_font")
+        or (self.ui.document and self.ui.document.default_font)
+end
+
 function FontSwitcher:switchFont(direction)
-    local fonts = self:getFontList()
+    -- Use the filtered list so Next / Previous respect the same checkboxes
+    -- as the dialog.  Meta and base list are cached; filter state is read
+    -- live so it always reflects the user's most recent dialog settings.
+    local fonts = self:_getFilteredFaces()
     if #fonts == 0 then
         UIManager:show(InfoMessage:new{ text = _("No fonts found in system.") })
         return
     end
 
-    local current_font = self.ui.doc_settings:readSetting("font_face")
-                  or G_reader_settings:readSetting("cre_font")
-                  or (self.ui.document and self.ui.document.default_font)
-                  or "Spleen"
+    local current_font = self:getCurrentFace() or "Spleen"
                   
     local idx = 0
     for i, name in ipairs(fonts) do
@@ -166,244 +307,24 @@ function FontSwitcher:switchFont(direction)
     self:applyFont(new_font_name)
 end
 
--- ── Font-chooser helpers ──────────────────────────────────────────────────────
---
--- FontChooser (ui/widget/fontchooser) operates on .ttf/.otf *filenames*
--- (e.g. "NotoSans-Regular.ttf"), while CREngine's font API works with *face
--- names* (e.g. "Noto Sans Regular") returned by getFontFaces().
---
--- We bridge the two worlds by scanning KOReader's font directories and
--- comparing normalised strings:
---
---   face "Noto Sans Regular"    → norm → "notosansregular"
---   file "NotoSans-Regular.ttf" → base → "NotoSans-Regular" → norm → "notosansregular"
---
--- Normalisation: lower-case, drop spaces / hyphens / underscores.
--- This handles the most common font-naming conventions.  The mapping is built
--- once per plugin instance and reused.
-
-local function _normName(s)
-    return (s or ""):lower():gsub("[%s%-%_]+", "")
-end
-
---- Scan font directories and return two lookup tables:
----   file_to_face[filename]  → face name
----   face_to_file[face_name] → filename
-local function _buildFontMap(face_list)
-    local face_to_file = {}
-    local file_to_face = {}
-
-    local ok_lfs, lfs = pcall(require, "lfs")
-    if not ok_lfs then return face_to_file, file_to_face end
-
-    -- Collect candidate directories.
-    local dirs = {}
-    local ok_ds, DataStorage = pcall(require, "datastorage")
-    if ok_ds then
-        table.insert(dirs, DataStorage:getDataDir() .. "/fonts")
-        if type(DataStorage.getFullDataDir) == "function" then
-            local full = DataStorage:getFullDataDir()
-            if full then table.insert(dirs, full .. "/fonts") end
-        end
-    end
-    table.insert(dirs, "fonts")                     -- KOReader bundled fonts
-    table.insert(dirs, "/system/fonts")             -- Android system
-    table.insert(dirs, "/system/product/fonts")     -- Android product partition
-    table.insert(dirs, "/usr/share/fonts/truetype") -- Debian / Ubuntu
-    table.insert(dirs, "/usr/share/fonts")
-
-    -- Pre-index normalised face names for O(1) lookup in pass 1.
-    local norm_to_face = {}
-    for _, face in ipairs(face_list) do
-        local n = _normName(face)
-        if not norm_to_face[n] then norm_to_face[n] = face end
-    end
-
-    -- Scan helper.
-    local function scanDir(dir, cb)
-        if lfs.attributes(dir, "mode") ~= "directory" then return end
-        for file in lfs.dir(dir) do
-            if file:match("%.[to][tf][f]$") or file:match("%.ttc$") then
-                cb(file)
-            end
-        end
-    end
-
-    -- Pass 1: exact normalised match.
-    local visited = {}
-    for _, dir in ipairs(dirs) do
-        if not visited[dir] then
-            visited[dir] = true
-            scanDir(dir, function(file)
-                local base   = file:match("^(.+)%.[^%.]+$") or file
-                local face   = norm_to_face[_normName(base)]
-                if face and not face_to_file[face] then
-                    face_to_file[face] = file
-                    file_to_face[file] = face
-                end
-            end)
-        end
-    end
-
-    -- Pass 2: substring / prefix match for still-unmatched faces.
-    for _, face in ipairs(face_list) do
-        if not face_to_file[face] then
-            local face_n = _normName(face)
-            for _, dir in ipairs(dirs) do
-                if not face_to_file[face] then
-                    scanDir(dir, function(file)
-                        if face_to_file[face] then return end
-                        local base   = file:match("^(.+)%.[^%.]+$") or file
-                        local base_n = _normName(base)
-                        if base_n:find(face_n, 1, true)
-                          or face_n:find(base_n, 1, true) then
-                            face_to_file[face] = file
-                            if not file_to_face[file] then
-                                file_to_face[file] = face
-                            end
-                        end
-                    end)
-                end
-            end
-        end
-    end
-
-    return face_to_file, file_to_face
-end
-
---- Lazy getter: builds the map once, then returns the cached tables.
-function FontSwitcher:_getFontMap(fonts)
-    if not self._face_to_file then
-        self._face_to_file, self._file_to_face = _buildFontMap(fonts)
-    end
-    return self._face_to_file, self._file_to_face
-end
-
---- Given a filename from FontChooser, resolve the best-matching face name.
---- Returns nil when no match can be determined.
-function FontSwitcher:_fileToFaceName(selected_file, fonts)
-    local _, file_to_face = self:_getFontMap(fonts)
-
-    -- 1. Direct cache hit.
-    if file_to_face[selected_file] then return file_to_face[selected_file] end
-
-    -- 2. Exact normalised match against the live face list.
-    local base_n = _normName(selected_file:match("^(.+)%.[^%.]+$") or selected_file)
-    for _, face in ipairs(fonts) do
-        if _normName(face) == base_n then return face end
-    end
-
-    -- 3. Substring / prefix match (last resort).
-    for _, face in ipairs(fonts) do
-        local fn = _normName(face)
-        if fn:find(base_n, 1, true) or base_n:find(fn, 1, true) then
-            return face
-        end
-    end
-
-    return nil
-end
-
--- ── showFontMenu: routes to FontChooser or falls back to the original TouchMenu
-
 function FontSwitcher:showFontMenu()
-    local fonts = self:getFontList()
-    if #fonts == 0 then
+    -- Build and cache the face list on first open.
+    if not self._face_list_cache then
+        self._face_list_cache = self:getFontList()
+    end
+    if #self._face_list_cache == 0 then
         UIManager:show(InfoMessage:new{ text = _("No fonts available.") })
         return
     end
 
-    -- Try our bundled font chooser first (fontchooser_local.lua ships with
-    -- the plugin and shows only serif fonts). Fall back to the system widget
-    -- if the local file is absent, then to the original TouchMenu.
-    local ok_fc, FontChooser = pcall(require, "fontchooser_local")
-    if not ok_fc then
-        ok_fc, FontChooser = pcall(require, "ui/widget/fontchooser")
-    end
-    if ok_fc and FontChooser then
-        self:_showWithFontChooser(FontChooser, fonts)
-    else
-        self:_showTouchMenu(fonts)
-    end
-end
-
---- Primary path: FontChooser dialog, mirroring the Zen UI plugin pattern.
-function FontSwitcher:_showWithFontChooser(FontChooser, fonts)
-    -- Read current face name the same way the original code does.
-    local current_face = self.ui.doc_settings:readSetting("font_face")
-                      or G_reader_settings:readSetting("cre_font")
-                      or (self.ui.document and self.ui.document.default_font)
-
-    local face_to_file, file_to_face = self:_getFontMap(fonts)
-
-    -- Resolve the .ttf file that corresponds to the active face so
-    -- FontChooser can pre-highlight it.
-    local current_file = current_face and face_to_file[current_face]
-
-    -- Default file fallback — mirrors Zen UI: prefer the footer/status-bar
-    -- UI font setting, then the resolved current file, then a hard-coded safe
-    -- value.
-    local footer_cfg   = G_reader_settings:readSetting("footer") or {}
-    local default_file = footer_cfg.text_font_face
-                      or current_file
-                      or "NotoSans-Regular.ttf"
-
-    UIManager:show(FontChooser:new{
-        title             = _("Select Font"),
-        font_file         = current_file or default_file,
-        default_font_file = default_file,
-        callback = function(selected_file)
-            -- Map the filename back to a CREngine face name.
-            local face = self:_fileToFaceName(selected_file, fonts)
-            if face then
-                -- Warm the cache so subsequent opens skip the scan.
-                file_to_face[selected_file] = face
-                face_to_file[face]          = selected_file
-                self:applyFont(face)
-            else
-                UIManager:show(InfoMessage:new{
-                    text = string.format(
-                        _("Could not match "%s" to a known font.\n\n"
-                       .. "If this font was recently added, restart KOReader "
-                       .. "so it is registered, then try again."),
-                        selected_file
-                    ),
-                    timeout = 5,
-                })
-            end
-        end,
+    local FontPickerDialog = require("font_picker_dialog")
+    UIManager:show(FontPickerDialog:new{
+        title        = _("Select Font"),
+        face_list    = self._face_list_cache,
+        face_meta    = self:_getFaceMeta(),
+        current_face = self:getCurrentFace(),
+        callback     = function(face) self:applyFont(face) end,
     })
-end
-
---- Fallback path: original TouchMenu-based font list (unchanged from v1.0).
-function FontSwitcher:_showTouchMenu(fonts)
-    local current_font = self.ui.doc_settings:readSetting("font_face")
-                      or G_reader_settings:readSetting("cre_font")
-                      or (self.ui.document and self.ui.document.default_font)
-
-    local menu_items = {}
-
-    for _, font_name in ipairs(fonts) do
-        table.insert(menu_items, {
-            text = font_name,
-            checked_func = function() return font_name == current_font end,
-            callback = function()
-                self:applyFont(font_name)
-            end,
-            -- Using full appbar names for certainty
-            icon = (font_name == current_font) and "check" or "appbar.textsize",
-        })
-    end
-
-    -- Setting tab icon to the full name to ensure it maps correctly
-    menu_items.icon = "appbar.typeset"
-
-    local menu = TouchMenu:new{
-        title = _("Select Font"),
-        tab_item_table = { menu_items },
-        width = Screen:getWidth(),
-    }
-    UIManager:show(menu)
 end
 
 function FontSwitcher:applyFont(font_name)
