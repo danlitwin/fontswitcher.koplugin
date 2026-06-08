@@ -1,5 +1,16 @@
 --[[--
 FontPickerDialog — purpose-built font selection dialog for the Font Switcher plugin.
+
+Design contract:
+  • Receives face names and pre-built metadata from the caller (main.lua).
+    No filename bridge, no system-widget dependency.
+  • Applies the selected font immediately on each tap so the user sees a live
+    preview in the document behind the dialog.
+  • Stays open until the user explicitly closes it.
+  • Filter checkboxes (B / I / Sans / Mono / Deco) persist across sessions via
+    G_reader_settings and are applied to the list on every open.
+  • Toggling a filter closes and immediately reopens the dialog; the currently
+    applied face is preserved as the pre-selection in the new instance.
 --]]--
 
 local Blitbuffer       = require("ffi/blitbuffer")
@@ -227,9 +238,17 @@ function FontPickerDialog:init()
 
     if self.radio_button_table_height > max_list_h then
         self.is_scrollable = true
-        local item_h = radio_button_table.checked_button:getSize().h
-        self.radio_buttons_per_page        = math.floor(max_list_h / item_h)
-        self.radio_button_container_height = self.radio_buttons_per_page * item_h
+        local checked = radio_button_table.checked_button
+        if checked then
+            -- Snap container height to a whole number of button rows.
+            local item_h = checked:getSize().h
+            self.radio_buttons_per_page        = math.floor(max_list_h / item_h)
+            self.radio_button_container_height = self.radio_buttons_per_page * item_h
+        else
+            -- Current face not in filtered list — no pre-selection.
+            -- Skip the snap; scroll still works, just without row alignment.
+            self.radio_button_container_height = max_list_h
+        end
     else
         self.radio_button_container_height = self.radio_button_table_height
     end

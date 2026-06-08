@@ -308,7 +308,6 @@ function FontSwitcher:switchFont(direction)
 end
 
 function FontSwitcher:showFontMenu()
-    -- Build and cache the face list on first open.
     if not self._face_list_cache then
         self._face_list_cache = self:getFontList()
     end
@@ -317,14 +316,31 @@ function FontSwitcher:showFontMenu()
         return
     end
 
-    local FontPickerDialog = require("font_picker_dialog")
-    UIManager:show(FontPickerDialog:new{
-        title        = _("Select Font"),
-        face_list    = self._face_list_cache,
-        face_meta    = self:_getFaceMeta(),
-        current_face = self:getCurrentFace(),
-        callback     = function(face) self:applyFont(face) end,
-    })
+    local ok, result = pcall(require, "font_picker_dialog")
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text    = "FontSwitcher: could not load font_picker_dialog.lua\n\n" .. tostring(result),
+            timeout = 15,
+        })
+        return
+    end
+
+    local FontPickerDialog = result
+    local ok2, err = pcall(function()
+        UIManager:show(FontPickerDialog:new{
+            title        = _("Select Font"),
+            face_list    = self._face_list_cache,
+            face_meta    = self:_getFaceMeta(),
+            current_face = self:getCurrentFace(),
+            callback     = function(face) self:applyFont(face) end,
+        })
+    end)
+    if not ok2 then
+        UIManager:show(InfoMessage:new{
+            text    = "FontSwitcher: dialog error\n\n" .. tostring(err),
+            timeout = 15,
+        })
+    end
 end
 
 function FontSwitcher:applyFont(font_name)
