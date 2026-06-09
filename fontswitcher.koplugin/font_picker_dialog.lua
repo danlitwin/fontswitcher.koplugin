@@ -16,12 +16,11 @@ Design contract:
 local Blitbuffer       = require("ffi/blitbuffer")
 local ButtonTable      = require("ui/widget/buttontable")
 local CenterContainer  = require("ui/widget/container/centercontainer")
-local CheckButton      = require("ui/widget/checkbutton")
 local FocusManager     = require("ui/widget/focusmanager")
+local Font             = require("ui/font")
 local FrameContainer   = require("ui/widget/container/framecontainer")
 local Geom             = require("ui/geometry")
 local GestureRange     = require("ui/gesturerange")
-local HorizontalGroup  = require("ui/widget/horizontalgroup")
 local InfoMessage      = require("ui/widget/infomessage")
 local MovableContainer = require("ui/widget/container/movablecontainer")
 local RadioButtonTable = require("ui/widget/radiobuttontable")
@@ -58,7 +57,7 @@ local FontPickerDialog = FocusManager:extend{
     face_meta    = nil,   -- { [face] = { bold, italic, sans, mono, deco } }
                           --   built by buildFaceMeta() in main.lua and cached there
     current_face = nil,   -- face name to pre-select (current book font)
-    callback     = nil,   -- function(face_name) — called on each selection change
+    on_select    = nil,   -- function(face_name) — called on each selection change
 }
 
 function FontPickerDialog:init()
@@ -115,13 +114,7 @@ function FontPickerDialog:init()
             name     = face,
             checked  = (face == self.selected_face),
             provider = face,
-            -- Note: no per-item preview font.  The face name is descriptive,
-            -- and the immediate-apply behaviour gives the user a live preview
-            -- in the document behind the dialog.
-            callback = function()
-                self.selected_face = face_ref
-                if self.callback then self.callback(face_ref) end
-            end,
+            face     = meta.file and Font:getFace(meta.file, 22, meta.index) or nil,
             hold_callback = function()
                 -- Show classification details on long-press.
                 local attrs = {}
@@ -151,6 +144,7 @@ function FontPickerDialog:init()
     end
 
     local scroll_inner_w = width - ScrollableContainer:getScrollbarWidth()
+    local dialog_ref = self
     local radio_button_table = RadioButtonTable:new{
         radio_buttons      = radio_buttons,
         width              = scroll_inner_w - 2 * Size.padding.large,
@@ -160,14 +154,26 @@ function FontPickerDialog:init()
         parent             = self,
         show_parent        = self,
     }
+
+    -- RadioButtonWidget calls self.parent:onTapSelect(self) directly when
+    -- tapped.  Wrapping the method on the instance (not the class) lets us
+    -- intercept every selection without modifying RadioButtonTable itself.
+    local _orig_onTapSelect = radio_button_table.onTapSelect
+    radio_button_table.onTapSelect = function(rbt, radio_button)
+        _orig_onTapSelect(rbt, radio_button)          -- original selection logic
+        local face = radio_button and radio_button.provider
+        if face then
+            dialog_ref.selected_face = face
+            if dialog_ref.on_select then dialog_ref.on_select(face) end
+        end
+    end
+
     self:mergeLayoutInVertical(radio_button_table)
 
     -- ── Filter row ────────────────────────────────────────────────────────────
-    -- One compact row of checkboxes.  Semantics: checked = shown in the list.
-    -- Each toggle saves to G_reader_settings immediately, then closes and
-    -- reopens this dialog so the list rebuilds with the updated filter.
-    -- self.selected_face is passed as the new current_face so the scroll
-    -- position and pre-selection reflect the last-applied font.
+    -- One row of buttons, one per category.  Checked state is shown with a
+    -- ☑/☐ prefix so no special parent-interface is required.  Tapping a
+    -- button toggles the filter, saves to settings, and reopens the dialog.
 
     local filter_defs = {
         { key = "bold",   label = "B"    },
@@ -177,14 +183,12 @@ function FontPickerDialog:init()
         { key = "deco",   label = "Deco" },
     }
 
-    local filter_group = HorizontalGroup:new{ align = "center" }
+    local filter_buttons = {{}}
     for _, f in ipairs(filter_defs) do
         local key        = f.key
         local dialog_ref = self
-        table.insert(filter_group, CheckButton:new{
-            text     = f.label,
-            checked  = _filters[key],
-            parent   = self,
+        table.insert(filter_buttons[1], {
+            text     = (_filters[key] and "☑ " or "☐ ") .. f.label,
             callback = function()
                 _filters[key] = not _filters[key]
                 G_reader_settings:saveSetting("fontswitcher_filters", _filters)
@@ -194,15 +198,17 @@ function FontPickerDialog:init()
                     face_list    = dialog_ref.face_list,
                     face_meta    = dialog_ref.face_meta,
                     current_face = dialog_ref.selected_face,
-                    callback     = dialog_ref.callback,
+                    on_select    = dialog_ref.on_select,
                 })
             end,
         })
     end
 
-    local filter_row = CenterContainer:new{
-        dimen = Geom:new{ w = width, h = filter_group:getSize().h },
-        filter_group,
+    local filter_button_table = ButtonTable:new{
+        width       = width - 2 * Size.padding.default,
+        buttons     = filter_buttons,
+        zero_sep    = true,
+        show_parent = self,
     }
 
     -- ── Close button ──────────────────────────────────────────────────────────
@@ -233,7 +239,7 @@ function FontPickerDialog:init()
     local max_list_h = math.floor(screen_h * 0.8
         - title_bar:getHeight()
         - Size.span.vertical_large * 6
-        - filter_row:getSize().h
+        - filter_button_table:getSize().h
         - button_table:getSize().h)
 
     if self.radio_button_table_height > max_list_h then
@@ -277,7 +283,7 @@ function FontPickerDialog:init()
             VerticalSpan:new{ width = Size.span.vertical_large * 2 },
             self.cropping_widget,
             VerticalSpan:new{ width = Size.span.vertical_large },
-            filter_row,
+            filter_button_table,
             VerticalSpan:new{ width = Size.span.vertical_large },
             CenterContainer:new{
                 dimen = Geom:new{ w = width, h = button_table:getSize().h },
